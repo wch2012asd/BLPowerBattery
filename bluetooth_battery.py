@@ -328,6 +328,7 @@ class BatteryWidget(QWidget):
         self._notified = {}      # instance_id -> last notified battery
         self._refreshing = False
         self._drag_pos = None
+        self._user_hidden = False    # 用户主动隐藏标志，区分 Win+D 系统隐藏
 
         self._init_window()
         self._init_ui()
@@ -477,8 +478,10 @@ class BatteryWidget(QWidget):
 
     def _toggle_visible(self):
         if self.isVisible():
+            self._user_hidden = True
             self.hide()
         else:
+            self._user_hidden = False
             self.show()
             self.raise_()
 
@@ -795,12 +798,36 @@ class BatteryWidget(QWidget):
     def closeEvent(self, e):
         if self.config.get("tray_visible", True):
             # 有托盘：关闭即最小化到托盘
+            self._user_hidden = True
             e.ignore()
             self.hide()
         else:
             # 托盘已隐藏：直接退出，避免窗口隐藏后无法恢复
             self._quit()
             e.accept()
+
+    # ----- Win+D 桌面切换保持显示
+    def nativeEvent(self, eventType, message):
+        """拦截 Windows 消息，Win+D 显示桌面后自动恢复窗口"""
+        if eventType == b"windows_generic_MSG":
+            try:
+                msg = wintypes.MSG.from_address(int(message))
+                # WM_WININICHANGE = 0x001A，Win+D / 显示桌面时发送
+                if msg.message == 0x001A and not self._user_hidden:
+                    QTimer.singleShot(50, self._ensure_visible_on_desktop)
+            except Exception:
+                pass
+        return super().nativeEvent(eventType, message)
+
+    def _ensure_visible_on_desktop(self):
+        """Win+D 后恢复窗口显示"""
+        if self._user_hidden:
+            return
+        if self.isMinimized():
+            self.showNormal()
+        if not self.isVisible():
+            self.show()
+        self.raise_()
 
 
 # ------------------------------------------------------------------ 入口
