@@ -164,58 +164,138 @@ def device_icon(name: str) -> str:
     return "🔋"
 
 
-# ------------------------------------------------------------------ 电量查询
+# ------------------------------------------------------------------ 电量查询 (SetupAPI 直调)
+_setupapi = ctypes.windll.setupapi
+
+DIGCF_PRESENT = 0x00000002
+DIGCF_ALLCLASSES = 0x00000004
+SPDRP_FRIENDLYNAME = 0x0000000C
+SPDRP_DEVICEDESC = 0x00000000
+DEVPROP_TYPE_BYTE = 0x00000003
+DEVPROP_TYPE_UINT32 = 0x00000007
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class _DEVPROPKEY(ctypes.Structure):
+    _fields_ = [("fmtid", _GUID), ("pid", wintypes.ULONG)]
+
+
+class _SP_DEVINFO_DATA(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("ClassGuid", _GUID),
+        ("DevInst", wintypes.DWORD),
+        ("Reserved", ctypes.c_void_p),
+    ]
+
+
+# DEVPKEY_Device_BatteryLevel = {104EA319-6EE2-4701-BD47-8DDBF425BBE5}, 2
+_BATTERY_PROPKEY = _DEVPROPKEY()
+_BATTERY_PROPKEY.fmtid.Data1 = 0x104EA319
+_BATTERY_PROPKEY.fmtid.Data2 = 0x6EE2
+_BATTERY_PROPKEY.fmtid.Data3 = 0x4701
+_BATTERY_PROPKEY.fmtid.Data4 = (wintypes.BYTE * 8)(
+    0xBD, 0x47, 0x8D, 0xDB, 0xF4, 0x25, 0xBB, 0xE5)
+_BATTERY_PROPKEY.pid = 2
+
+_setupapi.SetupDiGetClassDevsW.restype = wintypes.HANDLE
+_setupapi.SetupDiGetClassDevsW.argtypes = [
+    ctypes.c_void_p, wintypes.LPCWSTR, wintypes.HWND, wintypes.DWORD]
+_setupapi.SetupDiEnumDeviceInfo.restype = wintypes.BOOL
+_setupapi.SetupDiEnumDeviceInfo.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(_SP_DEVINFO_DATA)]
+_setupapi.SetupDiGetDevicePropertyW.restype = wintypes.BOOL
+_setupapi.SetupDiGetDevicePropertyW.argtypes = [
+    wintypes.HANDLE, ctypes.POINTER(_SP_DEVINFO_DATA),
+    ctypes.POINTER(_DEVPROPKEY), ctypes.POINTER(wintypes.ULONG),
+    wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
+_setupapi.SetupDiGetDeviceInstanceIdW.restype = wintypes.BOOL
+_setupapi.SetupDiGetDeviceInstanceIdW.argtypes = [
+    wintypes.HANDLE, ctypes.POINTER(_SP_DEVINFO_DATA),
+    wintypes.LPWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+_setupapi.SetupDiGetDeviceRegistryPropertyW.restype = wintypes.BOOL
+_setupapi.SetupDiGetDeviceRegistryPropertyW.argtypes = [
+    wintypes.HANDLE, ctypes.POINTER(_SP_DEVINFO_DATA),
+    wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+    wintypes.LPBYTE, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+_setupapi.SetupDiDestroyDeviceInfoList.restype = wintypes.BOOL
+_setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
+
+
 def query_bluetooth_devices():
-    """通过 PowerShell 读取已配对/在线蓝牙设备的电量，返回 [{name,battery,instance_id}]"""
-    ps_script = r"""
-$ErrorActionPreference = 'SilentlyContinue'
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$OutputEncoding = [System.Text.Encoding]::UTF8
-$result = @()
-# 优化：用 CIM 直接过滤蓝牙设备，避免 Get-PnpDevice -PresentOnly 获取全部数百个设备
-$bthDevices = Get-CimInstance -ClassName Win32_PnPEntity -Filter "PNPDeviceID LIKE '%%BTH%%'" -ErrorAction SilentlyContinue
-foreach ($d in $bthDevices) {
-    $iid = $d.PNPDeviceID
-    $batt = Get-PnpDeviceProperty -InstanceId $iid -KeyName '%s' -ErrorAction SilentlyContinue
-    if ($batt -and $null -ne $batt.Data -and $batt.Data -ge 0 -and $batt.Data -le 100) {
-        $name = $d.Name
-        if (-not $name) { $name = $iid }
-        $result += [PSCustomObject]@{ Name=$name; Battery=[int]$batt.Data; InstanceId=$iid }
-    }
-}
-if ($result.Count -eq 0) { '[]' } else { $result | ConvertTo-Json -Compress }
-""" % BATTERY_PROP_KEY
+    """直接通过 Windows SetupAPI 读取蓝牙设备电量，无需启动 PowerShell，速度快数十倍"""
+    result = []
+    hDevInfo = _setupapi.SetupDiGetClassDevsW(
+        None, None, None, DIGCF_PRESENT | DIGCF_ALLCLASSES)
+    if not hDevInfo:
+        return result
 
     try:
-        proc = subprocess.run(
-            [_powershell_exe(), "-NoProfile", "-NonInteractive", "-Command", ps_script],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=30,
-            creationflags=0x08000000,  # CREATE_NO_WINDOW
-        )
-        text = (proc.stdout or "").strip()
-        if not text or text.lower() == "null":
-            return []
-        data = json.loads(text)
-        if isinstance(data, dict):
-            data = [data]
-        # 按名称去重，保留电量较高的一条
-        dedup = {}
-        for item in data:
-            try:
-                name = str(item.get("Name", "未知设备")).strip()
-                batt = int(item.get("Battery", -1))
-            except (ValueError, TypeError):
+        idx = 0
+        while True:
+            di = _SP_DEVINFO_DATA()
+            di.cbSize = ctypes.sizeof(_SP_DEVINFO_DATA)
+            if not _setupapi.SetupDiEnumDeviceInfo(hDevInfo, idx, ctypes.byref(di)):
+                break
+            idx += 1
+
+            # 获取 InstanceId
+            iid_buf = ctypes.create_unicode_buffer(200)
+            iid_sz = wintypes.DWORD(0)
+            if not _setupapi.SetupDiGetDeviceInstanceIdW(
+                hDevInfo, ctypes.byref(di), iid_buf, 200, ctypes.byref(iid_sz)):
                 continue
-            if batt < 0:
+            instance_id = iid_buf.value
+            if "BTH" not in instance_id.upper():
                 continue
-            key = name.lower()
-            if key not in dedup or batt > dedup[key]["battery"]:
-                dedup[key] = {"name": name, "battery": batt,
-                              "instance_id": str(item.get("InstanceId", ""))}
-        return list(dedup.values())
-    except Exception:
-        return []
+
+            # 查询电量属性
+            ptype = wintypes.ULONG(0)
+            bval = wintypes.UINT(0)
+            rsz = wintypes.DWORD(0)
+            if not _setupapi.SetupDiGetDevicePropertyW(
+                hDevInfo, ctypes.byref(di), ctypes.byref(_BATTERY_PROPKEY),
+                ctypes.byref(ptype), ctypes.byref(bval),
+                ctypes.sizeof(wintypes.UINT), ctypes.byref(rsz), 0):
+                continue
+            if ptype.value not in (DEVPROP_TYPE_BYTE, DEVPROP_TYPE_UINT32):
+                continue
+            level = bval.value
+            if level < 0 or level > 100:
+                continue
+
+            # 获取设备名称
+            name_buf = ctypes.create_unicode_buffer(512)
+            name_sz = wintypes.DWORD(0)
+            name = instance_id
+            for prop in (SPDRP_FRIENDLYNAME, SPDRP_DEVICEDESC):
+                if _setupapi.SetupDiGetDeviceRegistryPropertyW(
+                    hDevInfo, ctypes.byref(di), prop, None,
+                    ctypes.cast(name_buf, wintypes.LPBYTE),
+                    ctypes.sizeof(name_buf), ctypes.byref(name_sz)):
+                    name = name_buf.value or instance_id
+                    break
+
+            result.append({"name": name, "battery": level,
+                           "instance_id": instance_id})
+    finally:
+        _setupapi.SetupDiDestroyDeviceInfoList(hDevInfo)
+
+    # 按名称去重，保留电量较高的一条
+    dedup = {}
+    for item in result:
+        key = item["name"].lower()
+        if key not in dedup or item["battery"] > dedup[key]["battery"]:
+            dedup[key] = item
+    return list(dedup.values())
 
 
 # ------------------------------------------------------------------ 设备卡片
@@ -341,6 +421,11 @@ class BatteryWidget(QWidget):
         self.timer.timeout.connect(self.refresh)
         self._apply_refresh_interval()
         self.refresh()
+
+        # Win+D 守护：定时检查窗口是否被系统隐藏，自动恢复
+        self._guard_timer = QTimer(self)
+        self._guard_timer.timeout.connect(self._guard_visibility)
+        self._guard_timer.start(300)
 
     # ----- 配置
     def _load_config(self):
@@ -807,27 +892,14 @@ class BatteryWidget(QWidget):
             e.accept()
 
     # ----- Win+D 桌面切换保持显示
-    def nativeEvent(self, eventType, message):
-        """拦截 Windows 消息，Win+D 显示桌面后自动恢复窗口"""
-        if eventType == b"windows_generic_MSG":
-            try:
-                msg = wintypes.MSG.from_address(int(message))
-                # WM_WININICHANGE = 0x001A，Win+D / 显示桌面时发送
-                if msg.message == 0x001A and not self._user_hidden:
-                    QTimer.singleShot(50, self._ensure_visible_on_desktop)
-            except Exception:
-                pass
-        return super().nativeEvent(eventType, message)
-
-    def _ensure_visible_on_desktop(self):
-        """Win+D 后恢复窗口显示"""
+    def _guard_visibility(self):
+        """定时检查：如果窗口被系统隐藏（Win+D）且用户未主动隐藏，则恢复显示"""
         if self._user_hidden:
             return
-        if self.isMinimized():
+        if not self.isVisible() or self.isMinimized():
             self.showNormal()
-        if not self.isVisible():
             self.show()
-        self.raise_()
+            self.raise_()
 
 
 # ------------------------------------------------------------------ 入口
