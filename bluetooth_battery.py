@@ -230,8 +230,8 @@ _setupapi.SetupDiDestroyDeviceInfoList.restype = wintypes.BOOL
 _setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
 
 
-def query_bluetooth_devices():
-    """直接通过 Windows SetupAPI 读取蓝牙设备电量，无需启动 PowerShell，速度快数十倍"""
+def _query_via_setupapi():
+    """通过 Windows SetupAPI 读取蓝牙设备电量（快速路径）"""
     result = []
     hDevInfo = _setupapi.SetupDiGetClassDevsW(
         None, None, None, DIGCF_PRESENT | DIGCF_ALLCLASSES)
@@ -286,6 +286,8 @@ def query_bluetooth_devices():
 
             result.append({"name": name, "battery": level,
                            "instance_id": instance_id})
+    except Exception:
+        pass
     finally:
         _setupapi.SetupDiDestroyDeviceInfoList(hDevInfo)
 
@@ -296,6 +298,65 @@ def query_bluetooth_devices():
         if key not in dedup or item["battery"] > dedup[key]["battery"]:
             dedup[key] = item
     return list(dedup.values())
+
+
+def _query_via_powershell():
+    """通过 PowerShell 读取蓝牙设备电量（回退方案，较慢但兼容性好）"""
+    ps_script = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$result = @()
+$bthDevices = Get-CimInstance -ClassName Win32_PnPEntity -Filter "PNPDeviceID LIKE '%%BTH%%'" -ErrorAction SilentlyContinue
+foreach ($d in $bthDevices) {
+    $iid = $d.PNPDeviceID
+    $batt = Get-PnpDeviceProperty -InstanceId $iid -KeyName '%s' -ErrorAction SilentlyContinue
+    if ($batt -and $null -ne $batt.Data -and $batt.Data -ge 0 -and $batt.Data -le 100) {
+        $name = $d.Name
+        if (-not $name) { $name = $iid }
+        $result += [PSCustomObject]@{ Name=$name; Battery=[int]$batt.Data; InstanceId=$iid }
+    }
+}
+if ($result.Count -eq 0) { '[]' } else { $result | ConvertTo-Json -Compress }
+""" % BATTERY_PROP_KEY
+
+    try:
+        proc = subprocess.run(
+            [_powershell_exe(), "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+        )
+        text = (proc.stdout or "").strip()
+        if not text or text.lower() == "null":
+            return []
+        data = json.loads(text)
+        if isinstance(data, dict):
+            data = [data]
+        dedup = {}
+        for item in data:
+            try:
+                name = str(item.get("Name", "未知设备")).strip()
+                batt = int(item.get("Battery", -1))
+            except (ValueError, TypeError):
+                continue
+            if batt < 0:
+                continue
+            key = name.lower()
+            if key not in dedup or batt > dedup[key]["battery"]:
+                dedup[key] = {"name": name, "battery": batt,
+                              "instance_id": str(item.get("InstanceId", ""))}
+        return list(dedup.values())
+    except Exception:
+        return []
+
+
+def query_bluetooth_devices():
+    """读取蓝牙设备电量：优先用 SetupAPI（极快），异常时回退到 PowerShell"""
+    try:
+        return _query_via_setupapi()
+    except Exception:
+        return _query_via_powershell()
 
 
 # ------------------------------------------------------------------ 设备卡片
@@ -592,7 +653,10 @@ class BatteryWidget(QWidget):
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _refresh_worker(self):
-        devs = query_bluetooth_devices()
+        try:
+            devs = query_bluetooth_devices()
+        except Exception:
+            devs = []
         self.devices_updated.emit(devs)
 
     def _on_devices_updated(self, devs):
