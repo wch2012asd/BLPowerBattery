@@ -172,16 +172,15 @@ $ErrorActionPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 $result = @()
-$all = Get-PnpDevice -PresentOnly
-foreach ($d in $all) {
-    $iid = $d.InstanceId
-    if ($iid -match 'BTH') {
-        $batt = Get-PnpDeviceProperty -InstanceId $iid -KeyName '%s' -ErrorAction SilentlyContinue
-        if ($batt -and $null -ne $batt.Data -and $batt.Data -ge 0 -and $batt.Data -le 100) {
-            $name = $d.FriendlyName
-            if (-not $name) { $name = $iid }
-            $result += [PSCustomObject]@{ Name=$name; Battery=[int]$batt.Data; InstanceId=$iid }
-        }
+# 优化：用 CIM 直接过滤蓝牙设备，避免 Get-PnpDevice -PresentOnly 获取全部数百个设备
+$bthDevices = Get-CimInstance -ClassName Win32_PnPEntity -Filter "PNPDeviceID LIKE '%%BTH%%'" -ErrorAction SilentlyContinue
+foreach ($d in $bthDevices) {
+    $iid = $d.PNPDeviceID
+    $batt = Get-PnpDeviceProperty -InstanceId $iid -KeyName '%s' -ErrorAction SilentlyContinue
+    if ($batt -and $null -ne $batt.Data -and $batt.Data -ge 0 -and $batt.Data -le 100) {
+        $name = $d.Name
+        if (-not $name) { $name = $iid }
+        $result += [PSCustomObject]@{ Name=$name; Battery=[int]$batt.Data; InstanceId=$iid }
     }
 }
 if ($result.Count -eq 0) { '[]' } else { $result | ConvertTo-Json -Compress }
