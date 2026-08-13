@@ -1,4 +1,7 @@
 # -*- coding: utf-8 -*-
+# 启动时间戳（在所有 import 之前记录，用于测量 EXE 解压 + 模块加载耗时）
+import time as _time_mod
+_STARTUP_TS = _time_mod.time()
 """
 蓝牙设备电量桌面显示
 - 无边框、背景透明、置顶桌面小部件
@@ -14,8 +17,20 @@ import subprocess
 import threading
 import ctypes
 import winreg
+import time
+import traceback
 from ctypes import wintypes
 from pathlib import Path
+
+# ------------------------------------------------------------------ 调试日志
+LOG_FILE = Path.home() / ".blpower_debug.log"
+
+def _log(msg):
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
 
 
 def _powershell_exe():
@@ -88,8 +103,38 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QWidget, QFrame, QLabel, QVBoxLayout, QHBoxLayout,
     QMenu, QSystemTrayIcon, QSlider, QWidgetAction, QColorDialog,
-    QGraphicsDropShadowEffect, QSizePolicy, QSpacerItem,
+    QSizePolicy, QSpacerItem,
 )
+
+# ------------------------------------------------------------------ Windows 窗口 API
+_user32 = ctypes.windll.user32
+_user32.GetForegroundWindow.restype = wintypes.HWND
+_user32.GetShellWindow.restype = wintypes.HWND
+_user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+_user32.GetClassNameW.restype = ctypes.c_int
+_user32.IsIconic.argtypes = [wintypes.HWND]
+_user32.IsIconic.restype = wintypes.BOOL
+_user32.IsWindowVisible.argtypes = [wintypes.HWND]
+_user32.IsWindowVisible.restype = wintypes.BOOL
+_user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+_user32.ShowWindow.restype = wintypes.BOOL
+_user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+_user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+_user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+_user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+_user32.SetWindowPos.argtypes = [
+    wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+    ctypes.c_int, ctypes.c_int, wintypes.UINT,
+]
+_user32.SetWindowPos.restype = wintypes.BOOL
+
+HWND_TOP = wintypes.HWND(0)
+GWLP_HWNDPARENT = -8
+SW_SHOWNOACTIVATE = 4
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
 
 # ------------------------------------------------------------------ 配置
 CONFIG_PATH = Path.home() / ".blpower_config.json"
@@ -233,13 +278,17 @@ _setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
 def _query_via_setupapi():
     """通过 Windows SetupAPI 读取蓝牙设备电量（快速路径）"""
     result = []
+    _log("_query_via_setupapi: 调用 SetupDiGetClassDevsW")
     hDevInfo = _setupapi.SetupDiGetClassDevsW(
         None, None, None, DIGCF_PRESENT | DIGCF_ALLCLASSES)
+    _log(f"_query_via_setupapi: hDevInfo={hDevInfo}")
     if not hDevInfo:
+        _log("_query_via_setupapi: hDevInfo 为空, 返回空列表")
         return result
 
     try:
         idx = 0
+        bth_count = 0
         while True:
             di = _SP_DEVINFO_DATA()
             di.cbSize = ctypes.sizeof(_SP_DEVINFO_DATA)
@@ -256,6 +305,8 @@ def _query_via_setupapi():
             instance_id = iid_buf.value
             if "BTH" not in instance_id.upper():
                 continue
+            bth_count += 1
+            _log(f"_query_via_setupapi: BTH 设备 #{bth_count}: {instance_id[:50]}")
 
             # 查询电量属性
             ptype = wintypes.ULONG(0)
@@ -265,12 +316,16 @@ def _query_via_setupapi():
                 hDevInfo, ctypes.byref(di), ctypes.byref(_BATTERY_PROPKEY),
                 ctypes.byref(ptype), ctypes.byref(bval),
                 ctypes.sizeof(wintypes.UINT), ctypes.byref(rsz), 0):
+                _log(f"  -> 无电量属性")
                 continue
             if ptype.value not in (DEVPROP_TYPE_BYTE, DEVPROP_TYPE_UINT32):
+                _log(f"  -> 属性类型不匹配: {ptype.value}")
                 continue
             level = bval.value
             if level < 0 or level > 100:
+                _log(f"  -> 电量值异常: {level}")
                 continue
+            _log(f"  -> 电量: {level}%")
 
             # 获取设备名称
             name_buf = ctypes.create_unicode_buffer(512)
@@ -286,8 +341,9 @@ def _query_via_setupapi():
 
             result.append({"name": name, "battery": level,
                            "instance_id": instance_id})
-    except Exception:
-        pass
+        _log(f"_query_via_setupapi: 扫描 {idx} 个设备, {bth_count} 个 BTH, {len(result)} 个有电量")
+    except Exception as e:
+        _log(f"_query_via_setupapi: 异常 {e}\n{traceback.format_exc()}")
     finally:
         _setupapi.SetupDiDestroyDeviceInfoList(hDevInfo)
 
@@ -353,10 +409,26 @@ if ($result.Count -eq 0) { '[]' } else { $result | ConvertTo-Json -Compress }
 
 def query_bluetooth_devices():
     """读取蓝牙设备电量：优先用 SetupAPI（极快），异常时回退到 PowerShell"""
+    _log("query_bluetooth_devices: 开始")
     try:
-        return _query_via_setupapi()
-    except Exception:
-        return _query_via_powershell()
+        t0 = time.time()
+        devs = _query_via_setupapi()
+        _log(f"query_bluetooth_devices: SetupAPI 完成, 耗时={time.time()-t0:.3f}s, 找到 {len(devs)} 个设备")
+        if devs:
+            for d in devs:
+                _log(f"  设备: {d['name']} = {d['battery']}%")
+            return devs
+        _log("query_bluetooth_devices: SetupAPI 返回空, 尝试 PowerShell 回退")
+    except Exception as e:
+        _log(f"query_bluetooth_devices: SetupAPI 异常: {e}\n{traceback.format_exc()}")
+    try:
+        t0 = time.time()
+        devs = _query_via_powershell()
+        _log(f"query_bluetooth_devices: PowerShell 完成, 耗时={time.time()-t0:.3f}s, 找到 {len(devs)} 个设备")
+        return devs
+    except Exception as e:
+        _log(f"query_bluetooth_devices: PowerShell 异常: {e}\n{traceback.format_exc()}")
+        return []
 
 
 # ------------------------------------------------------------------ 设备卡片
@@ -409,6 +481,9 @@ class DeviceCard(QFrame):
         # 右百分比
         lay.addWidget(self.pct_lbl)
 
+        # 异步刷新刚替换掉占位符时，外层布局可能还保留旧高度。
+        # 固定一个合理的最小高度，避免标签被压缩成一条横线。
+        self.setMinimumHeight(lay.sizeHint().height())
         self._update_bar()
 
     def _refresh_style(self):
@@ -464,16 +539,22 @@ class BatteryWidget(QWidget):
 
     def __init__(self):
         super().__init__()
+        _log("========== BatteryWidget __init__ 开始 ==========")
         self.config = self._load_config()
         self._devices = []
         self._notified = {}      # instance_id -> last notified battery
         self._refreshing = False
         self._drag_pos = None
         self._user_hidden = False    # 用户主动隐藏标志，区分 Win+D 系统隐藏
+        self._desktop_owner = None
 
+        _log("__init__: _init_window")
         self._init_window()
+        _log("__init__: _init_ui")
         self._init_ui()
+        _log("__init__: _init_tray")
         self._init_tray()
+        _log("__init__: _restore_position")
         self._restore_position()
 
         self.devices_updated.connect(self._on_devices_updated)
@@ -481,12 +562,15 @@ class BatteryWidget(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self._apply_refresh_interval()
+        _log("__init__: 首次 refresh()")
         self.refresh()
 
         # Win+D 守护：定时检查窗口是否被系统隐藏，自动恢复
         self._guard_timer = QTimer(self)
         self._guard_timer.timeout.connect(self._guard_visibility)
         self._guard_timer.start(300)
+        QTimer.singleShot(0, self._attach_to_desktop)
+        _log("========== __init__ 完成 ==========")
 
     # ----- 配置
     def _load_config(self):
@@ -537,11 +621,7 @@ class BatteryWidget(QWidget):
 
         self.card = QFrame(self)
         self.card.setObjectName("card")
-        shadow = QGraphicsDropShadowEffect(self.card)
-        shadow.setBlurRadius(24)
-        shadow.setOffset(0, 2)
-        shadow.setColor(QColor(0, 0, 0, 160))
-        self.card.setGraphicsEffect(shadow)
+        # 注意：移除 QGraphicsDropShadowEffect — 在透明窗口上会导致渲染极度缓慢
 
         self.vlay = QVBoxLayout(self.card)
         self.vlay.setContentsMargins(10, 10, 10, 10)
@@ -653,17 +733,23 @@ class BatteryWidget(QWidget):
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _refresh_worker(self):
+        _log("_refresh_worker: 线程启动")
         try:
             devs = query_bluetooth_devices()
-        except Exception:
+        except Exception as e:
+            _log(f"_refresh_worker: 异常 {e}\n{traceback.format_exc()}")
             devs = []
+        _log(f"_refresh_worker: 准备发送信号, 设备数={len(devs)}")
         self.devices_updated.emit(devs)
+        _log("_refresh_worker: 信号已发送")
 
     def _on_devices_updated(self, devs):
+        _log(f"_on_devices_updated: 收到信号, 设备数={len(devs)}")
         self._refreshing = False
         self._devices = devs
         self._rebuild_list()
         self._check_low_battery(devs)
+        _log("_on_devices_updated: UI 更新完成")
 
     def _rebuild_list(self):
         # 清空旧卡片：先解除父子关系立即隐藏，再延迟删除，避免残影/堆叠
@@ -686,7 +772,22 @@ class BatteryWidget(QWidget):
                 card = DeviceCard(d["name"], d["battery"], fc, fo, bo, self)
                 self.list_lay.addWidget(card)
         self._make_pass_through()
+        # 动态替换占位符后，当前事件循环中的 sizeHint 仍可能是旧值。
+        # 先激活各级布局，再在下一轮事件循环中按最终 sizeHint 调整窗口。
+        self._finish_layout()
+        QTimer.singleShot(0, self._finish_layout)
+
+    def _finish_layout(self):
+        self.list_lay.invalidate()
+        self.vlay.invalidate()
+        if self.layout():
+            self.layout().invalidate()
+        self.list_lay.activate()
+        self.vlay.activate()
+        if self.layout():
+            self.layout().activate()
         self.adjustSize()
+        self.update()
 
     def _update_cards_style(self):
         """仅更新现有卡片的透明度/颜色，不重建（用于滑块实时调节）"""
@@ -956,14 +1057,75 @@ class BatteryWidget(QWidget):
             e.accept()
 
     # ----- Win+D 桌面切换保持显示
+    def _attach_to_desktop(self):
+        """让窗口归属于桌面 Shell，避免被“显示桌面”当作普通应用窗口处理。"""
+        shell_hwnd = _user32.GetShellWindow()
+        if not shell_hwnd:
+            return False
+        hwnd = wintypes.HWND(int(self.winId()))
+        current_owner = _user32.GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT)
+        shell_value = int(shell_hwnd)
+        if current_owner != shell_value:
+            _user32.SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, shell_value)
+        self._desktop_owner = shell_value
+        return True
+
+    @staticmethod
+    def _desktop_is_foreground():
+        """当前前台窗口是否为 Windows 桌面。"""
+        hwnd = _user32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        class_name = ctypes.create_unicode_buffer(64)
+        if not _user32.GetClassNameW(hwnd, class_name, len(class_name)):
+            return False
+        return class_name.value in {"Progman", "WorkerW"}
+
     def _guard_visibility(self):
-        """定时检查：如果窗口被系统隐藏（Win+D）且用户未主动隐藏，则恢复显示"""
+        """恢复被 Win+D 隐藏或压到桌面层后面的窗口，但不抢输入焦点。"""
         if self._user_hidden:
             return
-        if not self.isVisible() or self.isMinimized():
+
+        hwnd = wintypes.HWND(int(self.winId()))
+        minimized = bool(_user32.IsIconic(hwnd))
+        native_visible = bool(_user32.IsWindowVisible(hwnd))
+        if not self.isVisible() or self.isMinimized() or minimized or not native_visible:
             self.showNormal()
             self.show()
-            self.raise_()
+            _user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+
+        self._attach_to_desktop()
+
+        # Win+D 后 Qt 仍可能报告窗口可见且未最小化，此时窗口只是被
+        # Shell 压到了桌面后面。桌面位于前台或原生窗口刚被隐藏时，
+        # 无焦点地恢复其 Z 序。
+        if minimized or not native_visible or self._desktop_is_foreground():
+            _user32.SetWindowPos(
+                hwnd, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+            self.update()
+
+    def _restore_after_show_desktop(self):
+        if self._user_hidden:
+            return
+        self._guard_visibility()
+
+    def nativeEvent(self, event_type, message):
+        """捕获 Win+D 导致的原生最小化，并在 Shell 操作完成后恢复。"""
+        try:
+            msg = wintypes.MSG.from_address(int(message))
+            # WM_SIZE / SIZE_MINIMIZED
+            if msg.message == 0x0005 and int(msg.wParam) == 1 and not self._user_hidden:
+                QTimer.singleShot(50, self._restore_after_show_desktop)
+                QTimer.singleShot(300, self._restore_after_show_desktop)
+        except (TypeError, ValueError):
+            pass
+        return super().nativeEvent(event_type, message)
+
+    def showEvent(self, event):
+        _log(f"showEvent: 窗口渲染 (从启动: {_time_mod.time()-_STARTUP_TS:.3f}s)")
+        super().showEvent(event)
 
 
 # ------------------------------------------------------------------ 入口
@@ -983,9 +1145,11 @@ def _ensure_single_instance():
 
 
 def main():
+    _log(f"========== 程序启动 (从脚本加载到 main: {_time_mod.time()-_STARTUP_TS:.3f}s) ==========")
     # 单实例检测：已运行则提示并退出
     _mutex, ok = _ensure_single_instance()
     if not ok:
+        _log("已有实例在运行, 退出")
         ctypes.windll.user32.MessageBoxW(
             0, "蓝牙电量程序已在运行中。", "BLPowerBattery", 0x40)  # MB_ICONINFORMATION
         return
@@ -999,8 +1163,11 @@ def main():
     # 尝试加载 emoji 字体回退
     QFontDatabase.addApplicationFont("Segoe UI Emoji")
 
+    _log("main: 创建 BatteryWidget")
     w = BatteryWidget()
+    _log("main: w.show()")
     w.show()
+    _log("main: 进入事件循环")
     sys.exit(app.exec())
 
 
