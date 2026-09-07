@@ -1,9 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 
+from pathlib import Path
+
+project_root = Path(SPECPATH)
+
+
 a = Analysis(
-    ['d:/MP/blpower/bluetooth_battery.py'],
-    pathex=[],
+    [str(project_root / 'src' / 'blpower' / 'app.py')],
+    pathex=[str(project_root / 'src')],
     binaries=[],
     datas=[],
     hiddenimports=[],
@@ -33,7 +38,8 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
+    version=str(project_root / 'scripts' / 'windows_version_info.txt'),
     codesign_identity=None,
     entitlements_file=None,
-    icon=['d:/MP/blpower/app.ico'],
+    icon=[str(project_root / 'assets' / 'app.ico')],
 )

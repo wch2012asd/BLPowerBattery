@@ -106,6 +106,13 @@ from PySide6.QtWidgets import (
     QSizePolicy, QSpacerItem,
 )
 
+try:
+    from blpower import __version__
+    from blpower.display import _pct_to_alpha, _rgba_a, battery_color, device_icon
+except ModuleNotFoundError:  # 支持直接运行 src/blpower/app.py
+    from version import __version__
+    from display import _pct_to_alpha, _rgba_a, battery_color, device_icon
+
 # ------------------------------------------------------------------ Windows 窗口 API
 _user32 = ctypes.windll.user32
 _user32.GetForegroundWindow.restype = wintypes.HWND
@@ -161,53 +168,6 @@ SIZE_PRESETS = {
     "medium": 290,
     "large": 360,
 }
-
-# 电量颜色分级
-def battery_color(level: int) -> str:
-    if level >= 50:
-        return "#3ee07a"   # 绿
-    if level >= 20:
-        return "#ffce4d"   # 黄
-    return "#ff5b5b"       # 红
-
-
-def _hex_to_rgb(h):
-    h = h.lstrip('#')
-    if len(h) == 3:
-        h = ''.join(c * 2 for c in h)
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-
-
-def _rgba_a(hex_color, alpha_0_255):
-    """将十六进制颜色 + alpha(0~255) 转为 stylesheet 可用的 rgba()"""
-    r, g, b = _hex_to_rgb(hex_color)
-    a = max(0, min(255, int(round(alpha_0_255))))
-    return f"rgba({r},{g},{b},{a})"
-
-
-def _pct_to_alpha(pct):
-    """不透明度百分比(0~100) -> alpha(0~255)"""
-    return max(0.0, min(100.0, float(pct))) / 100.0 * 255.0
-
-
-def device_icon(name: str) -> str:
-    n = name.lower()
-    if any(k in n for k in ["耳", "headphone", "earbud", "buds", "airpods", "buds"]):
-        return "🎧"
-    if any(k in n for k in ["mouse", "鼠标"]):
-        return "🖱️"
-    if any(k in n for k in ["keyboard", "键盘", "key"]):
-        return "⌨️"
-    if any(k in n for k in ["pen", "stylus", "笔", "pencil"]):
-        return "✏️"
-    if any(k in n for k in ["speaker", "音箱", "sound"]):
-        return "🔊"
-    if any(k in n for k in ["watch", "手表", "band", "手环"]):
-        return "⌚"
-    if any(k in n for k in ["phone", "手机"]):
-        return "📱"
-    return "🔋"
-
 
 # ------------------------------------------------------------------ 电量查询 (SetupAPI 直调)
 _setupapi = ctypes.windll.setupapi
@@ -610,7 +570,7 @@ class BatteryWidget(QWidget):
             flags |= Qt.WindowStaysOnTopHint
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setWindowTitle("蓝牙电量")
+        self.setWindowTitle(f"蓝牙电量 v{__version__}")
         self.setFixedWidth(SIZE_PRESETS.get(self.config.get("size_preset", "medium"), 290))
         self.setMinimumHeight(40)
 
@@ -677,7 +637,7 @@ class BatteryWidget(QWidget):
 
     def _init_tray(self):
         self.tray = QSystemTrayIcon(self._make_icon(), self)
-        self.tray.setToolTip("蓝牙电量")
+        self.tray.setToolTip(f"蓝牙电量 v{__version__}")
         self.tray.activated.connect(self._on_tray_activated)
         m = QMenu()
         a_show = QAction("显示/隐藏", self)

@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
-"""生成 BLPowerBattery 应用图标 app.ico（电池 + 闪电）"""
+"""生成 BLPowerBattery 应用图标和预览图。"""
+from pathlib import Path
+
 from PIL import Image, ImageDraw
 
 S = 256  # 画布尺寸
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ASSETS_DIR = PROJECT_ROOT / "assets"
 
 
 def draw_battery(size=S):
@@ -56,10 +60,11 @@ def draw_battery(size=S):
 
 def main():
     img = draw_battery(256)
-    out = r"d:\MP\blpower\app.ico"
+    ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+    out = ASSETS_DIR / "app.ico"
     img.save(out, sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
     # PNG 预览，便于查看效果
-    img.save(r"d:\MP\blpower\app_preview.png")
+    img.save(ASSETS_DIR / "app_preview.png")
     print("saved:", out)
 
 
