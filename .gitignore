@@ -6,6 +6,7 @@ __pycache__/
 
 # 虚拟环境
 .venv/
+.build-userbase/
 venv/
 env/
 
@@ -28,3 +29,4 @@ htmlcov/
 .DS_Store
 Thumbs.db
 *.log
+battery-diagnostics*.json

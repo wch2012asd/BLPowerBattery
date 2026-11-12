@@ -12,6 +12,13 @@ _STARTUP_TS = _time_mod.time()
 
 import os
 import sys
+# Dispatch before importing Qt or acquiring the application mutex.
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--battery-worker":
+    if not getattr(sys, "frozen", False):
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from blpower.hid_worker import main as worker_main
+    worker_main(sys.argv[2:])
+    raise SystemExit(0)
 import json
 import subprocess
 import threading
@@ -108,9 +115,16 @@ from PySide6.QtWidgets import (
 
 try:
     from blpower import __version__
+    from blpower.battery import query_providers, merge_readings
+    from blpower.windows_battery import query_windows_devices
+    from blpower.hid_service import query_hid_devices
     from blpower.display import _pct_to_alpha, _rgba_a, battery_color, device_icon
 except ModuleNotFoundError:  # 支持直接运行 src/blpower/app.py
     from version import __version__
+    from battery import query_providers, merge_readings
+    from windows_battery import query_windows_devices
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from blpower.hid_service import query_hid_devices
     from display import _pct_to_alpha, _rgba_a, battery_color, device_icon
 
 # ------------------------------------------------------------------ Windows 窗口 API
@@ -169,226 +183,10 @@ SIZE_PRESETS = {
     "large": 360,
 }
 
-# ------------------------------------------------------------------ 电量查询 (SetupAPI 直调)
-_setupapi = ctypes.windll.setupapi
+def query_wireless_devices():
+    return query_providers([("windows-property", query_windows_devices),
+                            ("hid", query_hid_devices)], _log)
 
-DIGCF_PRESENT = 0x00000002
-DIGCF_ALLCLASSES = 0x00000004
-SPDRP_FRIENDLYNAME = 0x0000000C
-SPDRP_DEVICEDESC = 0x00000000
-DEVPROP_TYPE_BYTE = 0x00000003
-DEVPROP_TYPE_UINT32 = 0x00000007
-
-
-class _GUID(ctypes.Structure):
-    _fields_ = [
-        ("Data1", wintypes.DWORD),
-        ("Data2", wintypes.WORD),
-        ("Data3", wintypes.WORD),
-        ("Data4", ctypes.c_ubyte * 8),
-    ]
-
-
-class _DEVPROPKEY(ctypes.Structure):
-    _fields_ = [("fmtid", _GUID), ("pid", wintypes.ULONG)]
-
-
-class _SP_DEVINFO_DATA(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.DWORD),
-        ("ClassGuid", _GUID),
-        ("DevInst", wintypes.DWORD),
-        ("Reserved", ctypes.c_void_p),
-    ]
-
-
-# DEVPKEY_Device_BatteryLevel = {104EA319-6EE2-4701-BD47-8DDBF425BBE5}, 2
-_BATTERY_PROPKEY = _DEVPROPKEY()
-_BATTERY_PROPKEY.fmtid.Data1 = 0x104EA319
-_BATTERY_PROPKEY.fmtid.Data2 = 0x6EE2
-_BATTERY_PROPKEY.fmtid.Data3 = 0x4701
-_BATTERY_PROPKEY.fmtid.Data4 = (wintypes.BYTE * 8)(
-    0xBD, 0x47, 0x8D, 0xDB, 0xF4, 0x25, 0xBB, 0xE5)
-_BATTERY_PROPKEY.pid = 2
-
-_setupapi.SetupDiGetClassDevsW.restype = wintypes.HANDLE
-_setupapi.SetupDiGetClassDevsW.argtypes = [
-    ctypes.c_void_p, wintypes.LPCWSTR, wintypes.HWND, wintypes.DWORD]
-_setupapi.SetupDiEnumDeviceInfo.restype = wintypes.BOOL
-_setupapi.SetupDiEnumDeviceInfo.argtypes = [
-    wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(_SP_DEVINFO_DATA)]
-_setupapi.SetupDiGetDevicePropertyW.restype = wintypes.BOOL
-_setupapi.SetupDiGetDevicePropertyW.argtypes = [
-    wintypes.HANDLE, ctypes.POINTER(_SP_DEVINFO_DATA),
-    ctypes.POINTER(_DEVPROPKEY), ctypes.POINTER(wintypes.ULONG),
-    wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
-_setupapi.SetupDiGetDeviceInstanceIdW.restype = wintypes.BOOL
-_setupapi.SetupDiGetDeviceInstanceIdW.argtypes = [
-    wintypes.HANDLE, ctypes.POINTER(_SP_DEVINFO_DATA),
-    wintypes.LPWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
-_setupapi.SetupDiGetDeviceRegistryPropertyW.restype = wintypes.BOOL
-_setupapi.SetupDiGetDeviceRegistryPropertyW.argtypes = [
-    wintypes.HANDLE, ctypes.POINTER(_SP_DEVINFO_DATA),
-    wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
-    wintypes.LPBYTE, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
-_setupapi.SetupDiDestroyDeviceInfoList.restype = wintypes.BOOL
-_setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
-
-
-def _query_via_setupapi():
-    """通过 Windows SetupAPI 读取蓝牙设备电量（快速路径）"""
-    result = []
-    _log("_query_via_setupapi: 调用 SetupDiGetClassDevsW")
-    hDevInfo = _setupapi.SetupDiGetClassDevsW(
-        None, None, None, DIGCF_PRESENT | DIGCF_ALLCLASSES)
-    _log(f"_query_via_setupapi: hDevInfo={hDevInfo}")
-    if not hDevInfo:
-        _log("_query_via_setupapi: hDevInfo 为空, 返回空列表")
-        return result
-
-    try:
-        idx = 0
-        bth_count = 0
-        while True:
-            di = _SP_DEVINFO_DATA()
-            di.cbSize = ctypes.sizeof(_SP_DEVINFO_DATA)
-            if not _setupapi.SetupDiEnumDeviceInfo(hDevInfo, idx, ctypes.byref(di)):
-                break
-            idx += 1
-
-            # 获取 InstanceId
-            iid_buf = ctypes.create_unicode_buffer(200)
-            iid_sz = wintypes.DWORD(0)
-            if not _setupapi.SetupDiGetDeviceInstanceIdW(
-                hDevInfo, ctypes.byref(di), iid_buf, 200, ctypes.byref(iid_sz)):
-                continue
-            instance_id = iid_buf.value
-            if "BTH" not in instance_id.upper():
-                continue
-            bth_count += 1
-            _log(f"_query_via_setupapi: BTH 设备 #{bth_count}: {instance_id[:50]}")
-
-            # 查询电量属性
-            ptype = wintypes.ULONG(0)
-            bval = wintypes.UINT(0)
-            rsz = wintypes.DWORD(0)
-            if not _setupapi.SetupDiGetDevicePropertyW(
-                hDevInfo, ctypes.byref(di), ctypes.byref(_BATTERY_PROPKEY),
-                ctypes.byref(ptype), ctypes.byref(bval),
-                ctypes.sizeof(wintypes.UINT), ctypes.byref(rsz), 0):
-                _log(f"  -> 无电量属性")
-                continue
-            if ptype.value not in (DEVPROP_TYPE_BYTE, DEVPROP_TYPE_UINT32):
-                _log(f"  -> 属性类型不匹配: {ptype.value}")
-                continue
-            level = bval.value
-            if level < 0 or level > 100:
-                _log(f"  -> 电量值异常: {level}")
-                continue
-            _log(f"  -> 电量: {level}%")
-
-            # 获取设备名称
-            name_buf = ctypes.create_unicode_buffer(512)
-            name_sz = wintypes.DWORD(0)
-            name = instance_id
-            for prop in (SPDRP_FRIENDLYNAME, SPDRP_DEVICEDESC):
-                if _setupapi.SetupDiGetDeviceRegistryPropertyW(
-                    hDevInfo, ctypes.byref(di), prop, None,
-                    ctypes.cast(name_buf, wintypes.LPBYTE),
-                    ctypes.sizeof(name_buf), ctypes.byref(name_sz)):
-                    name = name_buf.value or instance_id
-                    break
-
-            result.append({"name": name, "battery": level,
-                           "instance_id": instance_id})
-        _log(f"_query_via_setupapi: 扫描 {idx} 个设备, {bth_count} 个 BTH, {len(result)} 个有电量")
-    except Exception as e:
-        _log(f"_query_via_setupapi: 异常 {e}\n{traceback.format_exc()}")
-    finally:
-        _setupapi.SetupDiDestroyDeviceInfoList(hDevInfo)
-
-    # 按名称去重，保留电量较高的一条
-    dedup = {}
-    for item in result:
-        key = item["name"].lower()
-        if key not in dedup or item["battery"] > dedup[key]["battery"]:
-            dedup[key] = item
-    return list(dedup.values())
-
-
-def _query_via_powershell():
-    """通过 PowerShell 读取蓝牙设备电量（回退方案，较慢但兼容性好）"""
-    ps_script = r"""
-$ErrorActionPreference = 'SilentlyContinue'
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$OutputEncoding = [System.Text.Encoding]::UTF8
-$result = @()
-$bthDevices = Get-CimInstance -ClassName Win32_PnPEntity -Filter "PNPDeviceID LIKE '%%BTH%%'" -ErrorAction SilentlyContinue
-foreach ($d in $bthDevices) {
-    $iid = $d.PNPDeviceID
-    $batt = Get-PnpDeviceProperty -InstanceId $iid -KeyName '%s' -ErrorAction SilentlyContinue
-    if ($batt -and $null -ne $batt.Data -and $batt.Data -ge 0 -and $batt.Data -le 100) {
-        $name = $d.Name
-        if (-not $name) { $name = $iid }
-        $result += [PSCustomObject]@{ Name=$name; Battery=[int]$batt.Data; InstanceId=$iid }
-    }
-}
-if ($result.Count -eq 0) { '[]' } else { $result | ConvertTo-Json -Compress }
-""" % BATTERY_PROP_KEY
-
-    try:
-        proc = subprocess.run(
-            [_powershell_exe(), "-NoProfile", "-NonInteractive", "-Command", ps_script],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=30,
-            creationflags=0x08000000,  # CREATE_NO_WINDOW
-        )
-        text = (proc.stdout or "").strip()
-        if not text or text.lower() == "null":
-            return []
-        data = json.loads(text)
-        if isinstance(data, dict):
-            data = [data]
-        dedup = {}
-        for item in data:
-            try:
-                name = str(item.get("Name", "未知设备")).strip()
-                batt = int(item.get("Battery", -1))
-            except (ValueError, TypeError):
-                continue
-            if batt < 0:
-                continue
-            key = name.lower()
-            if key not in dedup or batt > dedup[key]["battery"]:
-                dedup[key] = {"name": name, "battery": batt,
-                              "instance_id": str(item.get("InstanceId", ""))}
-        return list(dedup.values())
-    except Exception:
-        return []
-
-
-def query_bluetooth_devices():
-    """读取蓝牙设备电量：优先用 SetupAPI（极快），异常时回退到 PowerShell"""
-    _log("query_bluetooth_devices: 开始")
-    try:
-        t0 = time.time()
-        devs = _query_via_setupapi()
-        _log(f"query_bluetooth_devices: SetupAPI 完成, 耗时={time.time()-t0:.3f}s, 找到 {len(devs)} 个设备")
-        if devs:
-            for d in devs:
-                _log(f"  设备: {d['name']} = {d['battery']}%")
-            return devs
-        _log("query_bluetooth_devices: SetupAPI 返回空, 尝试 PowerShell 回退")
-    except Exception as e:
-        _log(f"query_bluetooth_devices: SetupAPI 异常: {e}\n{traceback.format_exc()}")
-    try:
-        t0 = time.time()
-        devs = _query_via_powershell()
-        _log(f"query_bluetooth_devices: PowerShell 完成, 耗时={time.time()-t0:.3f}s, 找到 {len(devs)} 个设备")
-        return devs
-    except Exception as e:
-        _log(f"query_bluetooth_devices: PowerShell 异常: {e}\n{traceback.format_exc()}")
-        return []
 
 
 # ------------------------------------------------------------------ 设备卡片
@@ -409,8 +207,10 @@ class DeviceCard(QFrame):
 
         self.icon_lbl = QLabel(device_icon(name))
         self.icon_lbl.setObjectName("icon")
+        self.icon_lbl.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.name_lbl = QLabel(name)
         self.name_lbl.setObjectName("name")
+        self.name_lbl.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.name_lbl.setToolTip(name)
         # 过长名称省略
         fm = self.name_lbl.fontMetrics()
@@ -419,13 +219,16 @@ class DeviceCard(QFrame):
 
         self.pct_lbl = QLabel(f"{battery}%")
         self.pct_lbl.setObjectName("pct")
+        self.pct_lbl.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.pct_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         self.bar = QFrame(self)
         self.bar.setObjectName("bar")
+        self.bar.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.bar.setFixedHeight(7)
         self.fill = QFrame(self.bar)
         self.fill.setObjectName("fill")
+        self.fill.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.fill.move(0, 0)
         self.fill.setFixedHeight(7)
 
@@ -494,6 +297,7 @@ class DeviceCard(QFrame):
 # ------------------------------------------------------------------ 主窗口
 class BatteryWidget(QWidget):
     devices_updated = Signal(list)
+    devices_preview = Signal(list)
 
     SIZE_LABELS = {"small": "小", "medium": "中", "large": "大"}
 
@@ -518,6 +322,7 @@ class BatteryWidget(QWidget):
         self._restore_position()
 
         self.devices_updated.connect(self._on_devices_updated)
+        self.devices_preview.connect(self._on_devices_preview)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -570,7 +375,7 @@ class BatteryWidget(QWidget):
             flags |= Qt.WindowStaysOnTopHint
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setWindowTitle(f"蓝牙电量 v{__version__}")
+        self.setWindowTitle(f"无线设备电量 v{__version__}")
         self.setFixedWidth(SIZE_PRESETS.get(self.config.get("size_preset", "medium"), 290))
         self.setMinimumHeight(40)
 
@@ -581,6 +386,7 @@ class BatteryWidget(QWidget):
 
         self.card = QFrame(self)
         self.card.setObjectName("card")
+        self.card.setAttribute(Qt.WA_TransparentForMouseEvents)
         # 注意：移除 QGraphicsDropShadowEffect — 在透明窗口上会导致渲染极度缓慢
 
         self.vlay = QVBoxLayout(self.card)
@@ -593,7 +399,7 @@ class BatteryWidget(QWidget):
         self.list_lay.setSpacing(4)
         self.vlay.addLayout(self.list_lay)
 
-        self._placeholder = QLabel("正在检测蓝牙设备…")
+        self._placeholder = QLabel("正在检测无线设备…")
         self._placeholder.setObjectName("hint")
         self.list_lay.addWidget(self._placeholder)
 
@@ -637,7 +443,7 @@ class BatteryWidget(QWidget):
 
     def _init_tray(self):
         self.tray = QSystemTrayIcon(self._make_icon(), self)
-        self.tray.setToolTip(f"蓝牙电量 v{__version__}")
+        self.tray.setToolTip(f"无线设备电量 v{__version__}")
         self.tray.activated.connect(self._on_tray_activated)
         m = QMenu()
         a_show = QAction("显示/隐藏", self)
@@ -672,14 +478,33 @@ class BatteryWidget(QWidget):
             self.raise_()
 
     # ----- 位置
+    @staticmethod
+    def _is_rect_on_any_screen(rect: QRect) -> bool:
+        """检查给定矩形是否与任一可见屏幕有重叠（多显示器安全）"""
+        for scr in QGuiApplication.screens():
+            if rect.intersects(scr.availableGeometry()):
+                return True
+        return False
+
+    def _default_position(self):
+        """返回主显示器右上角的默认位置"""
+        screen = QGuiApplication.primaryScreen().availableGeometry()
+        return screen.right() - self.width() - 20, screen.top() + 20
+
     def _restore_position(self):
         x = self.config.get("pos_x")
         y = self.config.get("pos_y")
+        w, h = self.width(), self.height()
         if x is not None and y is not None:
-            self.move(int(x), int(y))
-        else:
-            screen = QGuiApplication.primaryScreen().availableGeometry()
-            self.move(screen.right() - self.width() - 20, screen.top() + 20)
+            target = QRect(int(x), int(y), w, h)
+            if self._is_rect_on_any_screen(target):
+                self.move(int(x), int(y))
+                _log(f"_restore_position: 恢复保存的位置 ({x}, {y})")
+                return
+            _log(f"_restore_position: 保存的位置 ({x}, {y}) 不在可见屏幕范围内，使用默认位置")
+        dx, dy = self._default_position()
+        self.move(dx, dy)
+        _log(f"_restore_position: 使用默认位置 ({dx}, {dy})")
 
     # ----- 刷新
     def _apply_refresh_interval(self):
@@ -690,18 +515,27 @@ class BatteryWidget(QWidget):
         if self._refreshing:
             return
         self._refreshing = True
-        threading.Thread(target=self._refresh_worker, daemon=True).start()
+        threading.Thread(target=self._refresh_worker, args=(list(self._devices),), daemon=True).start()
 
-    def _refresh_worker(self):
+    def _refresh_worker(self, previous):
         _log("_refresh_worker: 线程启动")
         try:
-            devs = query_bluetooth_devices()
+            windows = query_providers([("windows-property", query_windows_devices)], _log)
+            # Display fast Windows results without waiting for a sleeping receiver.
+            self.devices_preview.emit(merge_readings(windows + previous))
+            hid = query_providers([("hid", query_hid_devices)], _log)
+            devs = merge_readings(windows + hid)
         except Exception as e:
             _log(f"_refresh_worker: 异常 {e}\n{traceback.format_exc()}")
             devs = []
         _log(f"_refresh_worker: 准备发送信号, 设备数={len(devs)}")
         self.devices_updated.emit(devs)
         _log("_refresh_worker: 信号已发送")
+
+    def _on_devices_preview(self, devs):
+        if devs:
+            self._devices = devs
+            self._rebuild_list()
 
     def _on_devices_updated(self, devs):
         _log(f"_on_devices_updated: 收到信号, 设备数={len(devs)}")
@@ -720,7 +554,7 @@ class BatteryWidget(QWidget):
                 w.setParent(None)
                 w.deleteLater()
         if not self._devices:
-            ph = QLabel("未检测到带电量信息的蓝牙设备")
+            ph = QLabel("未检测到上报电量的设备")
             ph.setObjectName("hint")
             ph.setAlignment(Qt.AlignCenter)
             self.list_lay.addWidget(ph)

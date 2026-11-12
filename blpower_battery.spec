@@ -19,6 +19,12 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
+# Qt 6.11 uses the Windows system ICU. Some development environments also put
+# Poppler's incompatible ICU 78 on PATH; PyInstaller can accidentally collect
+# that copy and make QtCore fail with ERROR_PROC_NOT_FOUND. Never bundle it.
+a.binaries = [entry for entry in a.binaries
+              if entry[0].casefold() not in {"icuuc.dll", "icudt78.dll"}]
 pyz = PYZ(a.pure)
 
 exe = EXE(
