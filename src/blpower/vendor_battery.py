@@ -86,6 +86,25 @@ def logitech(device, identity):
     return readings
 
 
+def parse_asus(response):
+    # Report ID 0x03; battery percentage at [5], charging flag at [10].
+    if len(response) < 11 or response[0] != 0x03 or response[5] > 100:
+        return None
+    return {"battery": int(response[5]), "charging": bool(response[10])}
+
+
+def asus(device, identity):
+    # 64-byte output report: [0x03, 0x12, 0x07] queries battery (ROG Omni receiver).
+    response = device.exchange(
+        bytes((0x03, 0x12, 0x07)),
+        lambda r: len(r) >= 11 and r[0] == 0x03 and r[5] <= 100, timeout=0.8)
+    value = parse_asus(response)
+    if value is None:
+        return []
+    return [dict(value, name=device.info["name"], instance_id=identity,
+                 source="asus-rog-omni")]
+
+
 ADAPTERS = (
     Adapter("steelseries-arctis7", lambda d: d["vid"] == 0x1038
             and d["pid"] in (0x1260, 0x12AD) and d.get("interface") == 5
@@ -93,6 +112,10 @@ ADAPTERS = (
     Adapter("logitech-hidpp20", lambda d: d["vid"] == 0x046D
             and d["pid"] in (0xC52B, 0xC532, 0xC539)
             and (d["usage_page"], d["usage"]) == (0xFF00, 2), logitech),
+    # ROG Omni receiver control channel: MI_02 vendor collection (COL03, 0xFF01).
+    Adapter("asus-rog-omni", lambda d: d["vid"] == 0x0B05
+            and d["pid"] == 0x1ACE and d.get("interface") == 2
+            and d["usage_page"] >= 0xFF00, asus),
 )
 
 

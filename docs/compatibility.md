@@ -8,12 +8,15 @@
 | 标准 HID | Generic Device Controls 0x06 / Battery Strength 0x20，Feature 与 Input 报告 | 接口枚举已验证；有电量报告的硬件待测试 |
 | SteelSeries | VID 1038，PID 1260（Arctis 7）、12AD（Arctis 7 2019）；接口 5 的厂商集合 | 协议样本测试通过，实机待测试 |
 | Logitech | VID 046D，PID C52B / C532 / C539；Usage Page FF00、Usage 2；HID++ 2.0 功能 1004 / 1000 | 协议样本测试通过，实机待测试 |
+| ASUS | VID 0B05，PID 1ACE（ROG Omni 接收器）；接口 2 厂商集合（FF00+），Report ID 03，命令 12 07 | 协议样本测试通过，实机待测试 |
 
 Logitech 每个配对槽位动态发现电量功能，最多读取 6 个槽位；暂显示“Logitech 无线设备 N”。接收器型号匹配不保证每个配对设备都支持这些功能。暂不支持 HID++ 1.0、Bolt、仅电压/粗略等级上报、其他接收器 PID。不会把未知电量伪造为 0%。
 
 SteelSeries 暂不覆盖 Nova / 7+ / Pro。请求仅查询电量，不写入设备配置；目前协议未提供明确离线/充电标志，接收器可能返回缓存电量，关机和重新连接行为需重点实测。
 
-标准 HID 依照系统解析的描述符确定报告长度、ID、逻辑范围和字段。Feature 失败后尝试 Input；仅读取首个可用电量字段，不解释厂商自定义字段或一个集合内的多电池语义。USB/HID 本身不能证明设备一定使用 2.4G。
+ASUS 协议依据用户提供的 G-Helper 参考实现（ROG Keris II Ace / 月刃2 ACE 的 Omni 接收器）：64 字节 Output Report `[03 12 07]`，电量位于响应 `[5]`，充电状态位于响应 `[10]`（按 0/1 解析，语义待实机确认）。仅匹配 PID 1ACE 接收器的接口 2 厂商集合，不覆盖有线直连、蓝牙及其他接收器 PID；鼠标休眠时接收器能否应答需重点实测。
+
+标准 HID 依照系统解析的描述符确定报告长度、ID、逻辑范围和字段。Feature 失败后尝试 Input；仅读取首个可用电量字段，不解释厂商自定义字段或一个集合内的多电池语义。USB/HID 本身不能证明设备一定使用 2.4G。所有来源的读数在合并层统一过滤：电量 0% 视为休眠/无数据哨兵值（接收器在配对设备休眠时常报 0），不显示该卡片，设备列表为空时显示“未检测到无线设备”占位内容。
 
 ## 运行诊断
 
@@ -47,5 +50,6 @@ python scripts/diagnose.py --output battery-diagnostics.json
 - [HeadsetControl Arctis 7 定义](https://github.com/Sapd/HeadsetControl/blob/master/lib/devices/steelseries_arctis_7.hpp)
 - [HeadsetControl SteelSeries 传输协议](https://github.com/Sapd/HeadsetControl/blob/master/lib/devices/protocols/steelseries_protocol.hpp)
 - [Solaar HID++ 功能发现和电量字段](https://github.com/pwr-Solaar/Solaar/blob/master/lib/logitech_receiver/hidpp20.py)
+- [G-Helper（ROG Omni 接收器电量查询参考，Keris II Ace / PID 1ACE）](https://github.com/seerge/G-Helper)
 
 后续适配新型号应先确认协议、接口和响应字段，再加入白名单与协议测试；不能只添加一个 VID/PID 就宣称兼容。

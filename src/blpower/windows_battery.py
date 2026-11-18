@@ -4,6 +4,7 @@ from ctypes import wintypes
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 import traceback
@@ -94,6 +95,99 @@ _setupapi.SetupDiGetDeviceRegistryPropertyW.argtypes = [
     wintypes.LPBYTE, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
 _setupapi.SetupDiDestroyDeviceInfoList.restype = wintypes.BOOL
 _setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
+
+# ------------------------------------------------------------------ 连接状态
+# cfg.h: DN_DEVICE_DISCONNECTED (0x02000000) 置位表示设备当前未连接
+DN_DEVICE_DISCONNECTED = 0x02000000
+_BTH_ROOT_RE = re.compile(
+    r"^(?:BTHENUM|BTHLE)\\DEV_([0-9A-Fa-f]{12})\\", re.IGNORECASE)
+_MAC_DEV_RE = re.compile(r"DEV_([0-9A-Fa-f]{12})")
+_MAC_TAIL_RE = re.compile(r"&([0-9A-Fa-f]{12})(?:_|$)")
+
+_cm = ctypes.WinDLL("cfgmgr32", use_last_error=True)
+_cm.CM_Get_DevNode_Status.restype = ctypes.c_ulong  # CONFIGRET, 0 = CR_SUCCESS
+_cm.CM_Get_DevNode_Status.argtypes = [
+    ctypes.POINTER(wintypes.ULONG), ctypes.POINTER(wintypes.ULONG),
+    wintypes.ULONG, wintypes.ULONG]
+
+
+def _devnode_disconnected(devinst):
+    """读取设备节点状态；查询失败按未断开处理，避免误隐藏。"""
+    status = wintypes.ULONG(0)
+    problem = wintypes.ULONG(0)
+    if _cm.CM_Get_DevNode_Status(
+            ctypes.byref(status), ctypes.byref(problem), devinst, 0) != 0:
+        return False
+    return bool(status.value & DN_DEVICE_DISCONNECTED)
+
+
+def _extract_bt_mac(instance_id):
+    """从蓝牙实例 ID 提取 12 位 MAC 以定位根设备节点；非蓝牙返回 None。"""
+    if not instance_id:
+        return None
+    match = _MAC_DEV_RE.search(instance_id)
+    if match:
+        return match.group(1).lower()
+    match = _MAC_TAIL_RE.search(instance_id.rsplit("\\", 1)[-1])
+    if match:
+        return match.group(1).lower()
+    return None
+
+
+def _scan_bth_root_flags():
+    """枚举根设备节点，返回 {mac小写: 是否DN_DEVICE_DISCONNECTED}。"""
+    flags = {}
+    hDevInfo = _setupapi.SetupDiGetClassDevsW(
+        None, None, None, DIGCF_PRESENT | DIGCF_ALLCLASSES)
+    if not hDevInfo or hDevInfo == ctypes.c_void_p(-1).value:
+        raise OSError("SetupDiGetClassDevsW failed")
+    try:
+        idx = 0
+        while True:
+            di = _SP_DEVINFO_DATA()
+            di.cbSize = ctypes.sizeof(_SP_DEVINFO_DATA)
+            if not _setupapi.SetupDiEnumDeviceInfo(hDevInfo, idx, ctypes.byref(di)):
+                if ctypes.get_last_error() == 259:  # ERROR_NO_MORE_ITEMS
+                    break
+                raise ctypes.WinError(ctypes.get_last_error())
+            idx += 1
+            iid_buf = ctypes.create_unicode_buffer(200)
+            iid_sz = wintypes.DWORD(0)
+            if not _setupapi.SetupDiGetDeviceInstanceIdW(
+                    hDevInfo, ctypes.byref(di), iid_buf, 200, ctypes.byref(iid_sz)):
+                continue
+            match = _BTH_ROOT_RE.match(iid_buf.value)
+            if match:
+                flags[match.group(1).lower()] = _devnode_disconnected(di.DevInst)
+    finally:
+        _setupapi.SetupDiDestroyDeviceInfoList(hDevInfo)
+    _log(f"蓝牙根节点连接状态: {len(flags)} 个, "
+         f"已断开 {sum(1 for v in flags.values() if v)} 个")
+    return flags
+
+
+def _filter_disconnected(readings):
+    """隐藏所属蓝牙设备已断开的读数（Windows 设置显示“未连接”的设备）。"""
+    if not readings:
+        return readings
+    macs = {mac for mac in
+            (_extract_bt_mac(reading.get("instance_id")) for reading in readings)
+            if mac}
+    if not macs:
+        return readings
+    try:
+        flags = _scan_bth_root_flags()
+    except Exception as exc:
+        _log(f"连接状态扫描失败，跳过过滤: {exc}")
+        return readings
+    kept = []
+    for reading in readings:
+        mac = _extract_bt_mac(reading.get("instance_id"))
+        if mac and flags.get(mac):
+            _log(f"跳过未连接设备: {reading.get('name')} ({mac.upper()})")
+            continue
+        kept.append(reading)
+    return kept
 
 
 def _query_via_setupapi():
@@ -233,14 +327,14 @@ def query_windows_devices():
         t0 = time.time()
         devs = _query_via_setupapi()
         _log(f"Windows 电量扫描: {len(devs)} 个设备, {time.time()-t0:.3f}s")
-        return devs
+        return _filter_disconnected(devs)
     except Exception as e:
         _log(f"query_bluetooth_devices: SetupAPI 异常: {e}\n{traceback.format_exc()}")
     try:
         t0 = time.time()
         devs = _query_via_powershell()
         _log(f"query_bluetooth_devices: PowerShell 完成, 耗时={time.time()-t0:.3f}s, 找到 {len(devs)} 个设备")
-        return devs
+        return _filter_disconnected(devs)
     except Exception as e:
         _log(f"query_bluetooth_devices: PowerShell 异常: {e}\n{traceback.format_exc()}")
         return []

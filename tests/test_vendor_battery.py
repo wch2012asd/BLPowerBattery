@@ -4,7 +4,8 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from blpower.vendor_battery import (match_adapter, read_vendor, hidpp_request,
-                                    parse_arctis, parse_hidpp_status, parse_hidpp_unified)
+                                    parse_arctis, parse_hidpp_status,
+                                    parse_hidpp_unified, parse_asus)
 from blpower.battery import merge_readings
 
 
@@ -33,6 +34,36 @@ class VendorTests(unittest.TestCase):
                 assert matches(self_request)
                 return self_request
         self.assertEqual(read_vendor(Fake(), "headset")[0]["battery"], 100)
+
+    def test_asus_fixtures(self):
+        good = bytes((0x03, 0x12, 0x07, 0, 0, 64)) + bytes(4) + bytes((1,)) + bytes(53)
+        parsed = parse_asus(good)
+        self.assertEqual(parsed["battery"], 64)
+        self.assertTrue(parsed["charging"])
+        self.assertFalse(parse_asus(good[:10] + bytes(54))["charging"])
+        self.assertIsNone(parse_asus(good[:5]))
+        self.assertIsNone(parse_asus(b"\x04" + good[1:]))
+        self.assertIsNone(parse_asus(good[:5] + bytes((101,)) + good[6:]))
+
+    def test_asus_adapter_match_and_query(self):
+        info = dict(vid=0x0B05, pid=0x1ACE, interface=2, usage_page=0xFF01,
+                    usage=1, name="ROG Keris II Ace")
+        self.assertEqual(match_adapter(info).name, "asus-rog-omni")
+        self.assertIsNone(match_adapter(dict(info, usage_page=0x01)))
+        self.assertIsNone(match_adapter(dict(info, interface=0)))
+        self.assertIsNone(match_adapter(dict(info, pid=0x1ADF)))
+        response = bytes((0x03, 0x12, 0x07, 0, 0, 92)) + bytes(58)
+
+        class Fake:
+            def exchange(self, request, matches, timeout):
+                assert request == bytes((0x03, 0x12, 0x07))
+                assert matches(response)
+                return response
+        Fake.info = info
+        reading = read_vendor(Fake(), "receiver#mi=02")[0]
+        self.assertEqual(reading["battery"], 92)
+        self.assertEqual(reading["instance_id"], "receiver#mi=02")
+        self.assertEqual(reading["source"], "asus-rog-omni")
 
     def test_hidpp_invalid_and_unknown_battery(self):
         for data in (None, b"", b"\x00\x00\x00", b"\xff\x00\x00", b"\x50\x00\x07"):

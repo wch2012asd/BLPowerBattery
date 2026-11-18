@@ -16,10 +16,11 @@ class BatteryTests(unittest.TestCase):
         rows = [dict(name="Mouse", battery=50, instance_id=i) for i in ("HID\\A", "HID\\B")]
         self.assertEqual(len(merge_readings(rows)), 2)
 
-    def test_invalid_battery_is_not_zero(self):
+    def test_invalid_and_zero_battery_rejected(self):
         rows = [dict(instance_id=str(i), battery=v) for i, v in enumerate(
             [None, -1, 101, True, "50", 0, 100])]
-        self.assertEqual([r["battery"] for r in merge_readings(rows)], [0, 100])
+        # 无效值不能变成 0；0% 是休眠/无数据哨兵值，同样不进入显示列表。
+        self.assertEqual([r["battery"] for r in merge_readings(rows)], [100])
 
     def test_source_priority_and_failure_isolation(self):
         def broken():

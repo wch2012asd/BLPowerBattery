@@ -400,7 +400,9 @@ class BatteryWidget(QWidget):
         self.vlay.addLayout(self.list_lay)
 
         self._placeholder = QLabel("正在检测无线设备…")
-        self._placeholder.setObjectName("hint")
+        self._placeholder.setObjectName("placeholder")
+        self._placeholder.setAlignment(Qt.AlignCenter)
+        self._placeholder.setMinimumHeight(56)
         self.list_lay.addWidget(self._placeholder)
 
         outer.addWidget(self.card)
@@ -554,9 +556,10 @@ class BatteryWidget(QWidget):
                 w.setParent(None)
                 w.deleteLater()
         if not self._devices:
-            ph = QLabel("未检测到上报电量的设备")
-            ph.setObjectName("hint")
+            ph = QLabel("未检测到无线设备")
+            ph.setObjectName("placeholder")
             ph.setAlignment(Qt.AlignCenter)
+            ph.setMinimumHeight(56)
             self.list_lay.addWidget(ph)
         else:
             fc = self.config.get("font_color", "#FFFFFF")

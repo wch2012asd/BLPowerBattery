@@ -33,6 +33,10 @@ def execute(request):
         diagnostics = dict(device.info, instance_id=interface["instance_id"],
                            fields=fields, adapter=adapter.name if adapter else None)
         reading, errors = read_standard(device, interface["instance_id"])
+        # 0% means no data (receivers report 0 while the paired device sleeps);
+        # drop it so the vendor adapter gets a chance instead of being shadowed.
+        if reading is not None and reading.get("battery") == 0:
+            reading = None
         diagnostics["errors"] = errors
         readings = [reading] if reading else []
         if reading is None and adapter is not None:
@@ -40,6 +44,7 @@ def execute(request):
                 readings = read_vendor(device, interface["instance_id"], adapter)
             except (OSError, ValueError) as exc:
                 diagnostics["errors"].append(str(exc))
+        readings = [r for r in readings if r.get("battery") != 0]
         diagnostics["errors"].extend(device.vendor_errors)
         diagnostics["status"] = ("ok" if readings else "query-failed" if diagnostics["errors"]
                                  else "no-battery" if fields or adapter else "unsupported")

@@ -11,8 +11,10 @@ def merge_readings(readings):
     for reading in readings:
         level = reading.get("battery")
         identity = reading.get("instance_id")
+        # 0% is a sleep/no-data sentinel (receivers report 0 while the paired
+        # device sleeps or the cache is stale), never a usable reading.
         if (not isinstance(level, int) or isinstance(level, bool)
-                or not 0 <= level <= 100 or not identity):
+                or not 1 <= level <= 100 or not identity):
             continue
         result.setdefault(identity.casefold(), reading)
     return list(result.values())
