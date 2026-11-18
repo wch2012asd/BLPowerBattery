@@ -12,7 +12,7 @@ from blpower.version import __version__
 
 class DisplayHelpersTest(unittest.TestCase):
     def test_release_version(self):
-        self.assertEqual(__version__, "2.0.0.dev2")
+        self.assertEqual(__version__, "1.0.1")
 
     def test_battery_color_thresholds(self):
         self.assertEqual(battery_color(100), "#3ee07a")
