@@ -16,12 +16,12 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'BLPowerBattery'),
           StringStruct('FileDescription', 'Wireless device battery desktop widget'),
-          StringStruct('FileVersion', '1.0.1'),
+          StringStruct('FileVersion', '1.0.2'),
           StringStruct('InternalName', 'BLPowerBattery'),
           StringStruct('LegalCopyright', 'Copyright (c) 2026'),
           StringStruct('OriginalFilename', 'BLPowerBattery.exe'),
           StringStruct('ProductName', 'BLPowerBattery'),
-          StringStruct('ProductVersion', '1.0.1')
+          StringStruct('ProductVersion', '1.0.2')
         ]
       )
     ]),
