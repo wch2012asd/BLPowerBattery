@@ -5,7 +5,8 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from blpower.vendor_battery import (match_adapter, read_vendor, hidpp_request,
                                     parse_arctis, parse_hidpp_status,
-                                    parse_hidpp_unified, parse_asus)
+                                    parse_hidpp_unified, parse_asus,
+                                    parse_machenike)
 from blpower.battery import merge_readings
 
 
@@ -64,6 +65,38 @@ class VendorTests(unittest.TestCase):
         self.assertEqual(reading["battery"], 92)
         self.assertEqual(reading["instance_id"], "receiver#mi=02")
         self.assertEqual(reading["source"], "asus-rog-omni")
+
+    def test_machenike_fixtures(self):
+        # Real reply captured from the L8 Air receiver: battery 98 at [8].
+        good = bytes.fromhex("a1 50 01 03 0d 02 04 25 62 44 03 02 02 06 04 01 00 2b")
+        self.assertEqual(parse_machenike(good)["battery"], 98)
+        self.assertIsNone(parse_machenike(good[:8] + bytes((0xFF,)) + good[9:]))
+        self.assertIsNone(parse_machenike(good[:8] + bytes((101,)) + good[9:]))
+        self.assertIsNone(parse_machenike(good[:5]))
+        self.assertIsNone(parse_machenike(b"\xa0\x50" + good[2:]))
+        self.assertIsNone(parse_machenike(b"\xa1\x40" + good[2:]))
+
+    def test_machenike_adapter_match_and_query(self):
+        info = dict(vid=0x369B, pid=0x0054, usage_page=0xFFA0, usage=2, name="L8 Air")
+        self.assertEqual(match_adapter(info).name, "machenike-l8")
+        self.assertIsNone(match_adapter(dict(info, usage_page=0x0001)))
+        self.assertIsNone(match_adapter(dict(info, usage=1)))
+        self.assertIsNone(match_adapter(dict(info, pid=0x0055)))
+        self.assertEqual(match_adapter(dict(info, pid=0x0144)).name, "machenike-l8")
+        response = bytes.fromhex("a1 50 01 03 0d 02 04 25 5c 44 03 02 02 06 04 01 00 2b")
+
+        class Fake:
+            def exchange(self, request, matches, timeout):
+                assert request == b"\xa0\x50"
+                assert not matches(response[:8] + bytes((0xFF,)) + response[9:])
+                assert matches(response)
+                return response
+        Fake.info = info
+        reading = read_vendor(Fake(), "receiver#mi=04")[0]
+        self.assertEqual(reading["battery"], 92)
+        self.assertIsNone(reading["charging"])
+        self.assertEqual(reading["instance_id"], "receiver#mi=04")
+        self.assertEqual(reading["source"], "machenike-l8")
 
     def test_hidpp_invalid_and_unknown_battery(self):
         for data in (None, b"", b"\x00\x00\x00", b"\xff\x00\x00", b"\x50\x00\x07"):

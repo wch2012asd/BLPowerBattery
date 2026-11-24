@@ -105,6 +105,29 @@ def asus(device, identity):
                  source="asus-rog-omni")]
 
 
+def parse_machenike(response):
+    # Report ID 0xA1, command 0x50 (report_device_status); battery at [8], 0xFF invalid.
+    if len(response) < 9 or response[0] != 0xA1 or response[1] != 0x50:
+        return None
+    level = response[8]
+    if level > 100:
+        return None
+    return {"battery": int(level), "charging": None}
+
+
+def machenike(device, identity):
+    # 64-byte vendor channel (0xFFA0/usage 2): [0xA0, 0x50] queries device status.
+    response = device.exchange(
+        b"\xa0\x50",
+        lambda r: len(r) >= 9 and r[0] == 0xA1 and r[1] == 0x50 and r[8] <= 100,
+        timeout=0.8)
+    value = parse_machenike(response)
+    if value is None:
+        return []
+    return [dict(value, name=device.info["name"], instance_id=identity,
+                 source="machenike-l8")]
+
+
 ADAPTERS = (
     Adapter("steelseries-arctis7", lambda d: d["vid"] == 0x1038
             and d["pid"] in (0x1260, 0x12AD) and d.get("interface") == 5
@@ -116,6 +139,12 @@ ADAPTERS = (
     Adapter("asus-rog-omni", lambda d: d["vid"] == 0x0B05
             and d["pid"] == 0x1ACE and d.get("interface") == 2
             and d["usage_page"] >= 0xFF00, asus),
+    # MACHENIKE L8 receiver vendor channel: 0xFFA0/usage 2, PID list from the
+    # official Iton HID library log.
+    Adapter("machenike-l8", lambda d: d["vid"] == 0x369B
+            and d["pid"] in (0x00A3, 0x00B4, 0x0013, 0x0014, 0x0053, 0x0054,
+                             0x0043, 0x0044, 0x0133, 0x0154, 0x0123, 0x0144)
+            and (d["usage_page"], d["usage"]) == (0xFFA0, 2), machenike),
 )
 
 
