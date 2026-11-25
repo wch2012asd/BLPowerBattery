@@ -128,6 +128,47 @@ def machenike(device, identity):
                  source="machenike-l8")]
 
 
+def build_razer_request():
+    # 90-byte Razer report (openrazer razerchromacommon.c:
+    # razer_chroma_misc_get_battery_level -> class 0x07, id 0x80).
+    report = bytearray(90)
+    report[1] = 0xFF           # transaction id (Viper Ultimate)
+    report[5] = 0x02           # data size
+    report[6] = 0x07           # command class: battery
+    report[7] = 0x80           # command id: get battery level
+    crc = 0
+    for byte in report[2:88]:
+        crc ^= byte
+    report[88] = crc
+    return bytes(report)
+
+
+def parse_razer(response):
+    # Feature report: [0] report id, [1..90] 90-byte Razer report
+    # (openrazer razercommon.h). Battery = arguments[1], raw 0-255.
+    if len(response) < 91:
+        return None
+    report = response[1:]
+    if report[6] != 0x07 or report[7] != 0x80:
+        return None
+    if report[0] not in (0x01, 0x02):   # 0x04 = receiver timeout (mouse asleep)
+        return None
+    return {"battery": round(report[9] * 100 / 255), "charging": None}
+
+
+def razer(device, identity):
+    def matches(response):
+        # Correlate the echoed frame only; a status=0x04 reply parses to
+        # None ("no-battery") instead of spinning until TimeoutError.
+        return (len(response) > 8 and response[7] == 0x07 and response[8] == 0x80
+                and response[3:5] == b"\x00\x00")
+    value = parse_razer(device.feature(build_razer_request(), matches, timeout=0.8))
+    if value is None:
+        return []
+    return [dict(value, name=device.info["name"], instance_id=identity,
+                 source="razer-viper-ultimate")]
+
+
 ADAPTERS = (
     Adapter("steelseries-arctis7", lambda d: d["vid"] == 0x1038
             and d["pid"] in (0x1260, 0x12AD) and d.get("interface") == 5
@@ -145,6 +186,11 @@ ADAPTERS = (
             and d["pid"] in (0x00A3, 0x00B4, 0x0013, 0x0014, 0x0053, 0x0054,
                              0x0043, 0x0044, 0x0133, 0x0154, 0x0123, 0x0144)
             and (d["usage_page"], d["usage"]) == (0xFFA0, 2), machenike),
+    # Razer Viper Ultimate receiver: MI_00 mouse collection carries the
+    # 91-byte feature report (90-byte Razer report + report id).
+    Adapter("razer-viper-ultimate", lambda d: d["vid"] == 0x1532
+            and d["pid"] in (0x007A, 0x007B) and d.get("interface") == 0
+            and d["usage_page"] == 0x0001 and d["usage"] == 0x02, razer),
 )
 
 

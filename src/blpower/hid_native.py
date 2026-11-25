@@ -62,7 +62,8 @@ bind(hid, "HidD_FreePreparsedData", [P], U8)
 bind(hid, "HidP_GetCaps", [P, P], I32)
 bind(hid, "HidP_GetValueCaps", [c.c_int, P, P, P], I32)
 bind(hid, "HidP_GetUsageValue", [c.c_int, U16, U16, U16, P, P, P, U32], I32)
-for name in ("HidD_GetFeature", "HidD_GetInputReport", "HidD_SetOutputReport"):
+for name in ("HidD_GetFeature", "HidD_GetInputReport", "HidD_SetOutputReport",
+             "HidD_SetFeature"):
     bind(hid, name, [P, P, U32], U8)
 bind(kernel, "CreateFileW", [w.LPCWSTR, U32, U32, P, U32, U32, P], P)
 bind(kernel, "CloseHandle", [P], w.BOOL)
@@ -239,6 +240,28 @@ class Device:
             buffer = (U8 * self.caps.input_length)()
             length = self._io(kernel.ReadFile, buffer, deadline)
             response = bytes(buffer[:length])
+            if matches(response):
+                return response
+        raise TimeoutError("No matching HID response")
+
+    def feature(self, request, matches, timeout=0.8):
+        """Feature report exchange (SetFeature -> GetFeature) for vendor
+        protocols that cannot use interrupt output, e.g. Razer reports."""
+        length = self.caps.feature_length
+        if not 1 < length <= 65535 or len(request) + 1 > length:
+            raise ValueError("Vendor report incompatible with descriptor")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            output = (U8 * length)()
+            if request:
+                c.memmove(c.addressof(output) + 1, request, len(request))
+            if not hid.HidD_SetFeature(self.handle, output, length):
+                raise c.WinError(c.get_last_error())
+            time.sleep(0.06)  # receiver finishes the radio query (openrazer: 59900us)
+            buffer = (U8 * length)()
+            if not hid.HidD_GetFeature(self.handle, buffer, length):
+                raise c.WinError(c.get_last_error())
+            response = bytes(buffer)
             if matches(response):
                 return response
         raise TimeoutError("No matching HID response")

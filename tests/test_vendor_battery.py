@@ -6,7 +6,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from blpower.vendor_battery import (match_adapter, read_vendor, hidpp_request,
                                     parse_arctis, parse_hidpp_status,
                                     parse_hidpp_unified, parse_asus,
-                                    parse_machenike)
+                                    parse_machenike, build_razer_request,
+                                    parse_razer)
 from blpower.battery import merge_readings
 
 
@@ -151,3 +152,72 @@ class VendorTests(unittest.TestCase):
                     payload = b"\x32\x14\x00"
                 return (request[:4] + payload).ljust(20, b"\x00")
         self.assertEqual(read_vendor(Fake(), "receiver")[0]["battery"], 50)
+
+    def test_razer_request_layout_and_crc(self):
+        # Live-probed frame: 90-byte report, CRC 0x85 (0x02^0x07^0x80).
+        request = build_razer_request()
+        self.assertEqual(len(request), 90)
+        self.assertEqual(request[1], 0xFF)
+        self.assertEqual(request[5:8], bytes((0x02, 0x07, 0x80)))
+        self.assertEqual(request[88], 0x85)
+        crc = 0
+        for byte in request[2:88]:
+            crc ^= byte
+        self.assertEqual(crc, request[88])
+
+    @staticmethod
+    def _razer_response(status=0x02, level=0x99, command=(0x07, 0x80)):
+        # [0] report id, then 90-byte struct; battery = arguments[1] = [9].
+        report = bytearray(90)
+        report[0] = status
+        report[1] = 0xFF
+        report[5] = 0x02
+        report[6], report[7] = command
+        report[9] = level
+        return bytes((0x00,)) + bytes(report)
+
+    def test_razer_parse_fixtures(self):
+        self.assertEqual(parse_razer(self._razer_response(level=255))["battery"], 100)
+        self.assertEqual(parse_razer(self._razer_response(level=0))["battery"], 0)
+        # Receiver timeout while the mouse sleeps: no reading, not an error.
+        self.assertIsNone(parse_razer(self._razer_response(status=0x04, level=0)))
+        self.assertIsNone(parse_razer(self._razer_response(command=(0x07, 0x81))))
+        self.assertIsNone(parse_razer(self._razer_response()[:40]))
+        self.assertIsNone(parse_razer(b""))
+
+    def test_razer_adapter_match_and_query(self):
+        info = dict(vid=0x1532, pid=0x007B, interface=0, usage_page=0x0001,
+                    usage=0x02, name="Razer Viper Ultimate")
+        self.assertEqual(match_adapter(info).name, "razer-viper-ultimate")
+        self.assertEqual(match_adapter(dict(info, pid=0x007A)).name, "razer-viper-ultimate")
+        self.assertIsNone(match_adapter(dict(info, usage_page=0xFF00)))
+        self.assertIsNone(match_adapter(dict(info, interface=1)))
+        self.assertIsNone(match_adapter(dict(info, pid=0x007C)))
+        self.assertIsNone(match_adapter(dict(info, vid=0x046D)))
+        response = self._razer_response(status=0x02, level=184)
+
+        class Fake:
+            def feature(self, request, matches, timeout):
+                assert request == build_razer_request()
+                assert matches(response)
+                assert not matches(response[:3] + b"\x00\x01" + response[5:])
+                assert not matches(response[:8] + bytes((0x04,)) + response[9:])
+                return response
+        Fake.info = info
+        reading = read_vendor(Fake(), "mouse#mi=00")[0]
+        self.assertEqual(reading["battery"], 72)
+        self.assertIsNone(reading["charging"])
+        self.assertEqual(reading["instance_id"], "mouse#mi=00")
+        self.assertEqual(reading["source"], "razer-viper-ultimate")
+
+    def test_razer_sleeping_mouse_returns_no_readings(self):
+        info = dict(vid=0x1532, pid=0x007B, interface=0, usage_page=0x0001,
+                    usage=0x02, name="Razer Viper Ultimate")
+
+        class Fake:
+            def feature(self, request, matches, timeout):
+                response = VendorTests._razer_response(status=0x04, level=0)
+                assert matches(response)
+                return response
+        Fake.info = info
+        self.assertEqual(read_vendor(Fake(), "mouse#mi=00"), [])
